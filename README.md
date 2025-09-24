@@ -22,7 +22,7 @@ Think of `SANDSTAT` as a focused diagnostic tool for understanding process behav
 `sandstat` is built for Linux x86_64 systems and requires a C compiler (e.g., `gcc`). Follow these steps to install:
 
 ```bash
-git clone https://github.com/hd2s/sandstat.git
+git clone https://github.com/hd2s/SANDSTAT.git
 cd sandstat
 gcc -O2 -Wall -Wextra -o sandstat sandstat.c
 sudo mv sandstat /usr/local/bin/
