@@ -23,9 +23,9 @@ Think of `SANDSTAT` as a focused diagnostic tool for understanding process behav
 
 ```bash
 git clone https://github.com/hd2s/SANDSTAT.git
-cd sandstat
-gcc -O2 -Wall -Wextra -o sandstat sandstat.c
-sudo mv sandstat /usr/local/bin/
+cd SANDSTAT
+gcc -O2 -Wall -Wextra -o SANDSTAT sandstat.c
+sudo mv SANDSTAT /usr/local/bin/
 ```
 
 **Dependencies**: Standard C library and Linux headers (`sys/ptrace.h`, `sys/uio.h`, etc.). Ensure `_GNU_SOURCE` is defined for `process_vm_readv` support.
@@ -34,7 +34,7 @@ sudo mv sandstat /usr/local/bin/
 
 ## Usage
 
-Run `sandstat` with a command to trace:
+Run `SANDSTAT` with a command to trace:
 
 ```bash
 sandstat [-v] [-o output.json] -- <command> [args...]
@@ -91,7 +91,7 @@ sandstat -v -o summary.json -- ls -l
 
 ## Design Rationale
 
-`sandstat` uses the `ptrace` system call to intercept and count system calls made by a child process, offering low-overhead tracing compared to kernel-level tools like eBPF. It samples `/proc/<pid>/status` for memory usage (VmRSS) and employs `process_vm_readv` to extract file paths from syscalls like `openat`. The tool prioritizes simplicity and usability, providing a concise summary that avoids the verbosity of raw `strace` output. ANSI-colored tables and JSON output cater to both human readers and automated workflows.
+`SANDSTAT` uses the `ptrace` system call to intercept and count system calls made by a child process, offering low-overhead tracing compared to kernel-level tools like eBPF. It samples `/proc/<pid>/status` for memory usage (VmRSS) and employs `process_vm_readv` to extract file paths from syscalls like `openat`. The tool prioritizes simplicity and usability, providing a concise summary that avoids the verbosity of raw `strace` output. ANSI-colored tables and JSON output cater to both human readers and automated workflows.
 
 Key design choices:
 - **Lightweight**: Minimal dependencies, single-file C implementation (~400 LOC).
