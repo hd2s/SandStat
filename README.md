@@ -64,7 +64,7 @@ sandstat -v -o summary.json -- ls -l
 ║   Syscall         | Description                      | Count          ║
 ║   --------------  | ------------------------------   | ------         ║
 ║   mmap            | Maps memory region for process   | 8              ║
-║   openat          | Opens file relative to directory  | 5             ║
+║   openat          | Opens file relative to directory | 5              ║
 ║   fstat           | Gets file status by descriptor   | 4              ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║ Files Opened/Created                                                  ║
