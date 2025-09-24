@@ -1,4 +1,6 @@
 // sandstat.c
+// Copyright (c) 2025 Harsh Singh, University of Auckland. Licensed under the MIT License.
+
 // Developer-focused sandbox insight tool (Linux x86_64)
 // - Traces a child process via ptrace, counts syscalls,
 // - Extracts file paths from open/openat/creat,
@@ -31,6 +33,55 @@
 #error "This implementation currently targets Linux x86_64 only."
 #endif
 
+#include <sys/ioctl.h>
+
+static int use_color = 1;
+
+static int term_width(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 40)
+        return ws.ws_col;
+    const char *cols = getenv("COLUMNS");
+    if (cols) {
+        int v = atoi(cols);
+        if (v >= 40) return v;
+    }
+    return 100; // sensible default
+}
+
+static int num_digits_unsigned_unsigned(unsigned long v) {
+    int d = 1;
+    while (v >= 10) { v /= 10; d++; }
+    return d;
+}
+
+/* ANSI helpers */
+#define C_RESET   (use_color? "\033[0m"  : "")
+#define C_BOLD    (use_color? "\033[1m"  : "")
+#define C_DIM     (use_color? "\033[2m"  : "")
+#define C_RED     (use_color? "\033[31m" : "")
+#define C_GREEN   (use_color? "\033[32m" : "")
+#define C_YELLOW  (use_color? "\033[33m" : "")
+#define C_BLUE    (use_color? "\033[34m" : "")
+#define C_MAGENTA (use_color? "\033[35m" : "")
+#define C_CYAN    (use_color? "\033[36m" : "")
+
+/* Safe truncate with ellipsis for a given width (>= 3). Returns bytes printed. */
+static int print_fit(const char *s, int width) {
+    int n = (int)strlen(s);
+    if (n <= width) {
+        printf("%-*s", width, s);
+        return width;
+    }
+    if (width <= 3) {
+        for (int i=0;i<width;i++) putchar('.');
+        return width;
+    }
+    fwrite(s, 1, (size_t)(width-3), stdout);
+    fputs("...", stdout);
+    return width;
+}
+
 // ---------- Small utilities ----------
 static void die(const char *msg) {
     perror(msg);
@@ -48,67 +99,155 @@ static int starts_with(const char *s, const char *p) {
 }
 
 // ---------- Syscall name table (x86_64 Linux subset + holes) ----------
-typedef struct { long no; const char *name; } scmap;
+typedef struct { long no; const char *name; const char *desc; } scmap;
 static scmap syscall_table[] = {
-    { SYS_read, "read" }, { SYS_write, "write" }, { SYS_open, "open" },
-    { SYS_close, "close" }, { SYS_stat, "stat" }, { SYS_fstat, "fstat" },
-    { SYS_lstat, "lstat" }, { SYS_poll, "poll" }, { SYS_lseek, "lseek" },
-    { SYS_mmap, "mmap" }, { SYS_mprotect, "mprotect" }, { SYS_munmap, "munmap" },
-    { SYS_brk, "brk" }, { SYS_rt_sigaction, "rt_sigaction" },
-    { SYS_rt_sigprocmask, "rt_sigprocmask" }, { SYS_ioctl, "ioctl" },
-    { SYS_pread64, "pread64" }, { SYS_pwrite64, "pwrite64" },
-    { SYS_readv, "readv" }, { SYS_writev, "writev" },
-    { SYS_access, "access" }, { SYS_pipe, "pipe" }, { SYS_select, "select" },
-    { SYS_sched_yield, "sched_yield" }, { SYS_mremap, "mremap" },
-    { SYS_msync, "msync" }, { SYS_mincore, "mincore" }, { SYS_madvise, "madvise" },
-    { SYS_shmget, "shmget" }, { SYS_shmat, "shmat" }, { SYS_shmctl, "shmctl" },
-    { SYS_dup, "dup" }, { SYS_dup2, "dup2" }, { SYS_pause, "pause" },
-    { SYS_nanosleep, "nanosleep" }, { SYS_getitimer, "getitimer" },
-    { SYS_alarm, "alarm" }, { SYS_setitimer, "setitimer" },
-    { SYS_getpid, "getpid" }, { SYS_sendfile, "sendfile" },
-    { SYS_socket, "socket" }, { SYS_connect, "connect" }, { SYS_accept, "accept" },
-    { SYS_sendto, "sendto" }, { SYS_recvfrom, "recvfrom" },
-    { SYS_sendmsg, "sendmsg" }, { SYS_recvmsg, "recvmsg" },
-    { SYS_shutdown, "shutdown" }, { SYS_bind, "bind" }, { SYS_listen, "listen" },
-    { SYS_getsockname, "getsockname" }, { SYS_getpeername, "getpeername" },
-    { SYS_socketpair, "socketpair" }, { SYS_setsockopt, "setsockopt" },
-    { SYS_getsockopt, "getsockopt" }, { SYS_clone, "clone" }, { SYS_fork, "fork" },
-    { SYS_vfork, "vfork" }, { SYS_execve, "execve" }, { SYS_exit, "exit" },
-    { SYS_wait4, "wait4" }, { SYS_kill, "kill" }, { SYS_uname, "uname" },
-    { SYS_semget, "semget" }, { SYS_semop, "semop" }, { SYS_semctl, "semctl" },
-    { SYS_shmdt, "shmdt" }, { SYS_msgget, "msgget" }, { SYS_msgsnd, "msgsnd" },
-    { SYS_msgrcv, "msgrcv" }, { SYS_msgctl, "msgctl" }, { SYS_fcntl, "fcntl" },
-    { SYS_fsync, "fsync" }, { SYS_fdatasync, "fdatasync" }, { SYS_truncate, "truncate" },
-    { SYS_ftruncate, "ftruncate" }, { SYS_getdents, "getdents" },
-    { SYS_getcwd, "getcwd" }, { SYS_chdir, "chdir" }, { SYS_fchdir, "fchdir" },
-    { SYS_rename, "rename" }, { SYS_mkdir, "mkdir" }, { SYS_rmdir, "rmdir" },
-    { SYS_creat, "creat" }, { SYS_link, "link" }, { SYS_unlink, "unlink" },
-    { SYS_symlink, "symlink" }, { SYS_readlink, "readlink" },
-    { SYS_chmod, "chmod" }, { SYS_fchmod, "fchmod" }, { SYS_chown, "chown" },
-    { SYS_lchown, "lchown" }, { SYS_umask, "umask" }, { SYS_gettimeofday, "gettimeofday" },
-    { SYS_getrlimit, "getrlimit" }, { SYS_getrusage, "getrusage" },
-    { SYS_sysinfo, "sysinfo" }, { SYS_times, "times" }, { SYS_ptrace, "ptrace" },
-    { SYS_getuid, "getuid" }, { SYS_syslog, "syslog" }, { SYS_getgid, "getgid" },
-    { SYS_setuid, "setuid" }, { SYS_setgid, "setgid" }, { SYS_geteuid, "geteuid" },
-    { SYS_getegid, "getegid" }, { SYS_setpgid, "setpgid" }, { SYS_getppid, "getppid" },
-    { SYS_getpgrp, "getpgrp" }, { SYS_setsid, "setsid" }, { SYS_setreuid, "setreuid" },
-    { SYS_setregid, "setregid" }, { SYS_getgroups, "getgroups" },
-    { SYS_setgroups, "setgroups" }, { SYS_setresuid, "setresuid" },
-    { SYS_getresuid, "getresuid" }, { SYS_setresgid, "setresgid" },
-    { SYS_getresgid, "getresgid" }, { SYS_openat, "openat" }, { SYS_unlinkat, "unlinkat" },
-    { SYS_newfstatat, "newfstatat" }, { SYS_renameat, "renameat" },
-    { SYS_linkat, "linkat" }, { SYS_symlinkat, "symlinkat" }, { SYS_readlinkat, "readlinkat" },
-    { SYS_utimensat, "utimensat" }, { SYS_execveat, "execveat" },
-    { SYS_prlimit64, "prlimit64" }, { SYS_statx, "statx" },
-    // Additional syscalls to reduce unknowns
-    { SYS_arch_prctl, "arch_prctl" }, { SYS_set_robust_list, "set_robust_list" },
-    { SYS_get_robust_list, "get_robust_list" }, { SYS_futex, "futex" },
-    { SYS_set_tid_address, "set_tid_address" }, { SYS_getdents64, "getdents64" },
-    { SYS_clock_gettime, "clock_gettime" }, { SYS_getrandom, "getrandom" },
-    { SYS_rseq, "rseq" }, { SYS_pipe2, "pipe2" }, { SYS_epoll_create, "epoll_create" },
-    { SYS_epoll_ctl, "epoll_ctl" }, { SYS_epoll_wait, "epoll_wait" },
-    { SYS_eventfd2, "eventfd2" }, { SYS_inotify_init1, "inotify_init1" },
-    { SYS_inotify_add_watch, "inotify_add_watch" }, { SYS_inotify_rm_watch, "inotify_rm_watch" },
+    { SYS_read, "read", "Reads data from file descriptor" },
+    { SYS_write, "write", "Writes data to file descriptor" },
+    { SYS_open, "open", "Opens file with specified flags" },
+    { SYS_close, "close", "Closes an open file descriptor" },
+    { SYS_stat, "stat", "Gets file status from path" },
+    { SYS_fstat, "fstat", "Gets file status by descriptor" },
+    { SYS_lstat, "lstat", "Gets symbolic link file status" },
+    { SYS_poll, "poll", "Waits for events on descriptors" },
+    { SYS_lseek, "lseek", "Repositions file offset for descriptor" },
+    { SYS_mmap, "mmap", "Maps memory region for process" },
+    { SYS_mprotect, "mprotect", "Sets memory protection for region" },
+    { SYS_munmap, "munmap", "Unmaps memory region from process" },
+    { SYS_brk, "brk", "Adjusts program break for heap" },
+    { SYS_rt_sigaction, "rt_sigaction", "Sets signal handler for process" },
+    { SYS_rt_sigprocmask, "rt_sigprocmask", "Modifies blocked signals for process" },
+    { SYS_ioctl, "ioctl", "Controls device-specific operations" },
+    { SYS_pread64, "pread64", "Reads file at specific offset" },
+    { SYS_pwrite64, "pwrite64", "Writes file at specific offset" },
+    { SYS_readv, "readv", "Reads into multiple buffers" },
+    { SYS_writev, "writev", "Writes from multiple buffers" },
+    { SYS_access, "access", "Checks file access permissions" },
+    { SYS_pipe, "pipe", "Creates pipe for interprocess communication" },
+    { SYS_select, "select", "Monitors multiple descriptors for events" },
+    { SYS_sched_yield, "sched_yield", "Yields CPU to other processes" },
+    { SYS_mremap, "mremap", "Remaps memory region size/location" },
+    { SYS_msync, "msync", "Synchronizes memory with storage" },
+    { SYS_mincore, "mincore", "Checks memory page residency" },
+    { SYS_madvise, "madvise", "Advises kernel on memory usage" },
+    { SYS_shmget, "shmget", "Allocates shared memory segment" },
+    { SYS_shmat, "shmat", "Attaches shared memory to process" },
+    { SYS_shmctl, "shmctl", "Controls shared memory segment" },
+    { SYS_dup, "dup", "Duplicates file descriptor" },
+    { SYS_dup2, "dup2", "Duplicates descriptor to specific number" },
+    { SYS_pause, "pause", "Suspends process until signal" },
+    { SYS_nanosleep, "nanosleep", "Sleeps for specified time" },
+    { SYS_getitimer, "getitimer", "Gets interval timer value" },
+    { SYS_alarm, "alarm", "Sets process alarm clock" },
+    { SYS_setitimer, "setitimer", "Sets interval timer" },
+    { SYS_getpid, "getpid", "Gets process ID" },
+    { SYS_sendfile, "sendfile", "Transfers data between descriptors" },
+    { SYS_socket, "socket", "Creates new socket" },
+    { SYS_connect, "connect", "Initiates connection on socket" },
+    { SYS_accept, "accept", "Accepts incoming socket connection" },
+    { SYS_sendto, "sendto", "Sends data to specific address" },
+    { SYS_recvfrom, "recvfrom", "Receives data from socket" },
+    { SYS_sendmsg, "sendmsg", "Sends message via socket" },
+    { SYS_recvmsg, "recvmsg", "Receives message via socket" },
+    { SYS_shutdown, "shutdown", "Shuts down socket operations" },
+    { SYS_bind, "bind", "Binds socket to address" },
+    { SYS_listen, "listen", "Listens for socket connections" },
+    { SYS_getsockname, "getsockname", "Gets socket's local address" },
+    { SYS_getpeername, "getpeername", "Gets socket's peer address" },
+    { SYS_socketpair, "socketpair", "Creates paired sockets" },
+    { SYS_setsockopt, "setsockopt", "Sets socket options" },
+    { SYS_getsockopt, "getsockopt", "Gets socket options" },
+    { SYS_clone, "clone", "Creates new process or thread" },
+    { SYS_fork, "fork", "Creates new child process" },
+    { SYS_vfork, "vfork", "Creates child with shared memory" },
+    { SYS_execve, "execve", "Executes new program" },
+    { SYS_exit, "exit", "Terminates calling process" },
+    { SYS_wait4, "wait4", "Waits for child process status" },
+    { SYS_kill, "kill", "Sends signal to process" },
+    { SYS_uname, "uname", "Gets system information" },
+    { SYS_semget, "semget", "Creates semaphore set" },
+    { SYS_semop, "semop", "Performs semaphore operations" },
+    { SYS_semctl, "semctl", "Controls semaphore set" },
+    { SYS_shmdt, "shmdt", "Detaches shared memory" },
+    { SYS_msgget, "msgget", "Creates message queue" },
+    { SYS_msgsnd, "msgsnd", "Sends message to queue" },
+    { SYS_msgrcv, "msgrcv", "Receives message from queue" },
+    { SYS_msgctl, "msgctl", "Controls message queue" },
+    { SYS_fcntl, "fcntl", "Controls file descriptor properties" },
+    { SYS_fsync, "fsync", "Synchronizes file with storage" },
+    { SYS_fdatasync, "fdatasync", "Synchronizes file data" },
+    { SYS_truncate, "truncate", "Truncates file to length" },
+    { SYS_ftruncate, "ftruncate", "Truncates file by descriptor" },
+    { SYS_getdents, "getdents", "Gets directory entries" },
+    { SYS_getcwd, "getcwd", "Gets current working directory" },
+    { SYS_chdir, "chdir", "Changes working directory" },
+    { SYS_fchdir, "fchdir", "Changes directory by descriptor" },
+    { SYS_rename, "rename", "Renames file or directory" },
+    { SYS_mkdir, "mkdir", "Creates new directory" },
+    { SYS_rmdir, "rmdir", "Removes empty directory" },
+    { SYS_creat, "creat", "Creates new file" },
+    { SYS_link, "link", "Creates hard link" },
+    { SYS_unlink, "unlink", "Removes file link" },
+    { SYS_symlink, "symlink", "Creates symbolic link" },
+    { SYS_readlink, "readlink", "Reads symbolic link target" },
+    { SYS_chmod, "chmod", "Changes file permissions" },
+    { SYS_fchmod, "fchmod", "Changes permissions by descriptor" },
+    { SYS_chown, "chown", "Changes file ownership" },
+    { SYS_lchown, "lchown", "Changes ownership of symlink" },
+    { SYS_umask, "umask", "Sets file creation mask" },
+    { SYS_gettimeofday, "gettimeofday", "Gets current time" },
+    { SYS_getrlimit, "getrlimit", "Gets resource limits" },
+    { SYS_getrusage, "getrusage", "Gets resource usage" },
+    { SYS_sysinfo, "sysinfo", "Gets system statistics" },
+    { SYS_times, "times", "Gets process times" },
+    { SYS_ptrace, "ptrace", "Traces process execution" },
+    { SYS_getuid, "getuid", "Gets user ID" },
+    { SYS_syslog, "syslog", "Logs to system log" },
+    { SYS_getgid, "getgid", "Gets group ID" },
+    { SYS_setuid, "setuid", "Sets user ID" },
+    { SYS_setgid, "setgid", "Sets group ID" },
+    { SYS_geteuid, "geteuid", "Gets effective user ID" },
+    { SYS_getegid, "getegid", "Gets effective group ID" },
+    { SYS_setpgid, "setpgid", "Sets process group ID" },
+    { SYS_getppid, "getppid", "Gets parent process ID" },
+    { SYS_getpgrp, "getpgrp", "Gets process group ID" },
+    { SYS_setsid, "setsid", "Creates new session" },
+    { SYS_setreuid, "setreuid", "Sets real/effective user ID" },
+    { SYS_setregid, "setregid", "Sets real/effective group ID" },
+    { SYS_getgroups, "getgroups", "Gets supplementary group IDs" },
+    { SYS_setgroups, "setgroups", "Sets supplementary group IDs" },
+    { SYS_setresuid, "setresuid", "Sets real/effective/saved user ID" },
+    { SYS_getresuid, "getresuid", "Gets real/effective/saved user ID" },
+    { SYS_setresgid, "setresgid", "Sets real/effective/saved group ID" },
+    { SYS_getresgid, "getresgid", "Gets real/effective/saved group ID" },
+    { SYS_openat, "openat", "Opens file relative to directory" },
+    { SYS_unlinkat, "unlinkat", "Removes file relative to directory" },
+    { SYS_newfstatat, "newfstatat", "Gets file status relative to directory" },
+    { SYS_renameat, "renameat", "Renames file relative to directory" },
+    { SYS_linkat, "linkat", "Creates link relative to directory" },
+    { SYS_symlinkat, "symlinkat", "Creates symlink relative to directory" },
+    { SYS_readlinkat, "readlinkat", "Reads symlink relative to directory" },
+    { SYS_utimensat, "utimensat", "Sets file timestamps" },
+    { SYS_execveat, "execveat", "Executes program relative to directory" },
+    { SYS_prlimit64, "prlimit64", "Sets/gets process resource limits" },
+    { SYS_statx, "statx", "Gets extended file status" },
+    // Additional syscalls from previous suggestion
+    { SYS_arch_prctl, "arch_prctl", "Sets architecture-specific thread state" },
+    { SYS_set_robust_list, "set_robust_list", "Sets robust futex list" },
+    { SYS_get_robust_list, "get_robust_list", "Gets robust futex list" },
+    { SYS_futex, "futex", "Manages fast user-space mutexes" },
+    { SYS_set_tid_address, "set_tid_address", "Sets thread ID address" },
+    { SYS_getdents64, "getdents64", "Gets directory entries (64-bit)" },
+    { SYS_clock_gettime, "clock_gettime", "Gets current time of clock" },
+    { SYS_getrandom, "getrandom", "Generates random bytes" },
+    { SYS_rseq, "rseq", "Implements restartable sequences" },
+    { SYS_pipe2, "pipe2", "Creates pipe with flags" },
+    { SYS_epoll_create, "epoll_create", "Creates epoll instance" },
+    { SYS_epoll_ctl, "epoll_ctl", "Controls epoll instance" },
+    { SYS_epoll_wait, "epoll_wait", "Waits for epoll events" },
+    { SYS_eventfd2, "eventfd2", "Creates event file descriptor" },
+    { SYS_inotify_init1, "inotify_init1", "Initializes inotify instance" },
+    { SYS_inotify_add_watch, "inotify_add_watch", "Adds watch to inotify" },
+    { SYS_inotify_rm_watch, "inotify_rm_watch", "Removes watch from inotify" },
 };
 static const size_t syscall_table_len = sizeof(syscall_table)/sizeof(syscall_table[0]);
 
@@ -116,6 +255,12 @@ static const char* syscall_name(long no) {
     for (size_t i=0;i<syscall_table_len;i++)
         if (syscall_table[i].no == no) return syscall_table[i].name;
     return NULL;
+}
+
+static const char* syscall_desc(long no) {
+    for (size_t i=0;i<syscall_table_len;i++)
+        if (syscall_table[i].no == no) return syscall_table[i].desc;
+    return "Unknown system call function";
 }
 
 // ---------- Dynamic arrays ----------
@@ -186,64 +331,144 @@ static long read_vmrss_kb(pid_t pid) {
 // ---------- Main tracer ----------
 static int verbose = 0;
 static const char *out_path = NULL;
+/* Sunglasses ASCII art — clean, rectangular, cool 😎 */
+static const char *side_art[] = {
+    "      ________     ________      ",
+    "  . - ~|        |-^-|        |~ - .  ",
+    "{      |        |   |        |      }",
+    "        `.____.'     `.____.'       "
+    };
+static const size_t side_art_lines = sizeof(side_art)/sizeof(side_art[0]);
 
 static void print_summary(SysVec *sys, StrVec *files, double sec, long peak_kb, int exited, int code, int sig) {
-    // ANSI color codes
-    #define ANSI_RESET   "\033[0m"
-    #define ANSI_BOLD    "\033[1m"
-    #define ANSI_CYAN    "\033[36m"
-    #define ANSI_GREEN   "\033[32m"
-    #define ANSI_YELLOW  "\033[33m"
-    #define ANSI_MAGENTA "\033[35m"
-    #define ANSI_RED     "\033[31m"
+    /* Sort syscalls by count desc up front */
+    for (size_t i=0;i<sys->n;i++)
+        for (size_t j=i+1;j<sys->n;j++)
+            if (sys->a[j].count > sys->a[i].count) {
+                SysCount t = sys->a[i]; sys->a[i] = sys->a[j]; sys->a[j] = t;
+            }
 
-    // Print header
-    printf("\n%s╔════════════════════════════ sandstat Summary ════════════════════════════╗%s\n", ANSI_CYAN, ANSI_RESET);
+    int tw = term_width();
 
-    // Execution stats
-    printf("%s║%s Execution Stats %s║%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_CYAN, ANSI_RESET);
-    printf("%s║%s Wall Time:  %s%.3f seconds%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, sec, ANSI_RESET);
+    /* Header */
+    printf("\n%s%s╔══════════════════════════════════════════════════════════════════════╗%s\n",
+           C_CYAN, C_BOLD, C_RESET);
+    printf("%s%s║%s  SANDSTAT - System Call Staticstics Tool - Ver-0.1 %s\n", C_CYAN, C_BOLD, C_RESET, C_CYAN);
+    printf("╠══════════════════════════════════════════════════════════════════════╣%s\n", C_RESET);
+
+    /* Exec stats */
+    printf("║ %sWall time%s  : %s%.3f s%s\n", C_BOLD, C_RESET, C_GREEN, sec, C_RESET);
     if (peak_kb >= 0) {
-        printf("%s║%s Peak RSS:   %s%ld kB (%.2f MB)%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, peak_kb, peak_kb/1024.0, ANSI_RESET);
+        printf("║ %sPeak RSS%s   : %s%ld kB (%.2f MB)%s\n", C_BOLD, C_RESET, C_GREEN, peak_kb, peak_kb/1024.0, C_RESET);
     }
     if (exited) {
-        printf("%s║%s Exit Status: %s%d%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, code, ANSI_RESET);
+        printf("║ %sExit status%s: %s%d%s\n", C_BOLD, C_RESET, C_GREEN, code, C_RESET);
     } else {
-        printf("%s║%s Terminated by Signal: %s%d%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_RED, sig, ANSI_RESET);
+        printf("║ %sSignal%s     : %s%d%s\n", C_BOLD, C_RESET, C_RED, sig, C_RESET);
     }
-    printf("%s╠══════════════════════════════════════════════════════════════════════════╣%s\n", ANSI_CYAN, ANSI_RESET);
 
-    // Syscall counts
-    printf("%s║%s Top Syscalls (Top %zu)%s\n", ANSI_CYAN, ANSI_BOLD, sys->n < 20 ? sys->n : 20, ANSI_RESET);
-    if (sys->n == 0) {
-        printf("%s║%s   (none captured)%s\n", ANSI_CYAN, ANSI_YELLOW, ANSI_RESET);
+    printf("%s╠══════════════════════════════════════════════════════════════════════╣%s\n", C_CYAN, C_RESET);
+
+    /* Table: Syscall / Description / Count
+       Layout adapts to terminal width:
+       - NAME_W dynamic to the longest syscall (min 10, max 24)
+       - COUNT_W based on largest count width (min 5)
+       - DESC_W = remaining space
+    */
+    size_t show = sys->n < 20 ? sys->n : 20;
+
+    int longest_name = 10;
+    unsigned long max_count = 0;
+    for (size_t i=0;i<show;i++) {
+        const char *nm = syscall_name(sys->a[i].no);
+        if (!nm) nm = "(unknown)";
+        int len = (int)strlen(nm);
+        if (len > longest_name) longest_name = len;
+        if (sys->a[i].count > max_count) max_count = sys->a[i].count;
+    }
+    if (longest_name > 24) longest_name = 24;
+    if (longest_name < 10) longest_name = 10;
+
+    int COUNT_W = num_digits_unsigned_unsigned(max_count);
+    if (COUNT_W < 5) COUNT_W = 5;
+    /* Borders and paddings eat ~6 chars; reserve */
+    int NAME_W = longest_name;
+    /* after computing NAME_W and COUNT_W */
+    int DESC_W = tw - (NAME_W + COUNT_W + 9);
+
+    /* NEW: hard cap the description width */
+    int MAX_DESC_W = 48;                       /* tweak to taste */
+    const char *env_descw = getenv("SANDSTAT_DESCW");
+    if (env_descw) {
+        int v = atoi(env_descw);
+        if (v >= 12 && v <= 200) MAX_DESC_W = v;   /* allow override via env */
+    }
+    if (DESC_W > MAX_DESC_W) DESC_W = MAX_DESC_W;
+
+    /* keep your existing safety floor */
+    if (DESC_W < 18) {
+        int delta = 18 - DESC_W;
+        NAME_W -= delta;
+        if (NAME_W < 8) NAME_W = 8;
+        DESC_W = tw - (NAME_W + COUNT_W + 9);
+        if (DESC_W < 12) DESC_W = 12;
+    }
+
+
+    /* Header row */
+    printf("║ %s%-*s%s  %s%-*s%s  %s%*s%s ║\n",
+           C_BOLD, NAME_W, "Syscall", C_RESET,
+           C_BOLD, DESC_W, "Description", C_RESET,
+           C_BOLD, COUNT_W, "Count", C_RESET);
+
+    /* Underline that matches EXACT table width (no full-terminal dashes) */
+    printf("║ ");
+    for (int i = 0; i < NAME_W; i++) putchar('-');
+    printf("  ");
+    for (int i = 0; i < DESC_W; i++) putchar('-');
+    printf("  ");
+    for (int i = 0; i < COUNT_W; i++) putchar('-');
+    printf(" ║\n");
+
+
+
+    if (show == 0) {
+        printf("║ %s(none captured)%s\n", C_DIM, C_RESET);
     } else {
-        // Sort syscalls by count (descending)
-        for (size_t i = 0; i < sys->n; i++)
-            for (size_t j = i + 1; j < sys->n; j++)
-                if (sys->a[j].count > sys->a[i].count) {
-                    SysCount t = sys->a[i]; sys->a[i] = sys->a[j]; sys->a[j] = t;
-                }
-        size_t show = sys->n < 20 ? sys->n : 20;
-        for (size_t i = 0; i < show; i++) {
+        for (size_t i=0;i<show;i++) {
             const char *nm = syscall_name(sys->a[i].no);
-            printf("%s║%s   %-20s : %s%lu%s\n", ANSI_CYAN, ANSI_BOLD, nm ? nm : "(unknown)", ANSI_YELLOW, sys->a[i].count, ANSI_RESET);
+            const char *desc = syscall_desc(sys->a[i].no);
+            if (!nm) nm = "(unknown)";
+            if (!desc) desc = "Unknown system call function";
+
+            /* Zebra stripe for readability */
+            int stripe = (int)(i & 1);
+            const char *rowc = stripe ? C_RESET : C_DIM;
+
+            printf("║ %s%-*s%s  ", C_CYAN, NAME_W, nm, C_RESET);
+            fputs(C_YELLOW, stdout);
+            print_fit(desc, DESC_W);
+            fputs(C_RESET, stdout);
+            printf("  %s%*lu%s ║\n", C_GREEN, COUNT_W, sys->a[i].count, rowc);
+
         }
     }
-    printf("%s╠══════════════════════════════════════════════════════════════════════════╣%s\n", ANSI_CYAN, ANSI_RESET);
 
-    // Files accessed
-    printf("%s║%s Files Opened/Created%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    printf("%s╠══════════════════════════════════════════════════════════════════════╣%s\n", C_CYAN, C_RESET);
+
+    /* Files section */
+    printf("║ %sFiles Opened/Created%s\n", C_BOLD, C_RESET);
     if (files->n == 0) {
-        printf("%s║%s   (none captured)%s\n", ANSI_CYAN, ANSI_YELLOW, ANSI_RESET);
+        printf("║ %s(none captured)%s\n", C_DIM, C_RESET);
     } else {
-        for (size_t i = 0; i < files->n; i++) {
-            printf("%s║%s   %s%s%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_MAGENTA, files->a[i], ANSI_RESET);
+        for (size_t i=0;i<files->n;i++) {
+            printf("║   %s%s%s\n", C_MAGENTA, files->a[i], C_RESET);
         }
     }
-    printf("%s╚══════════════════════════════════════════════════════════════════════════╝%s\n", ANSI_CYAN, ANSI_RESET);
 
-    // JSON output
+    printf("%s╚══════════════════════════════════════════════════════════════════════╝%s\n\n", C_CYAN, C_RESET);
+
+    /* JSON output (unchanged) */
     if (out_path) {
         FILE *o = fopen(out_path, "w");
         if (!o) { perror("fopen -o"); return; }
@@ -253,28 +478,34 @@ static void print_summary(SysVec *sys, StrVec *files, double sec, long peak_kb, 
         if (exited) fprintf(o, "  \"exit_status\": %d,\n", code);
         else        fprintf(o, "  \"term_signal\": %d,\n", sig);
         fprintf(o, "  \"syscalls\": [\n");
-        for (size_t i = 0; i < sys->n; i++) {
+        for (size_t i=0;i<sys->n;i++) {
             const char *nm = syscall_name(sys->a[i].no);
-            fprintf(o, "    {\"name\":\"%s\",\"count\":%lu}%s\n",
-                nm ? nm : "unknown", sys->a[i].count, (i + 1 < sys->n) ? "," : "");
-        }
-        fprintf(o, "  ],\n  \"files\": [\n");
-        for (size_t i = 0; i < files->n; i++) {
-            const char *s = files->a[i];
-            fputc(' ', o); fputc(' ', o); fputc(' ', o); fputc(' ', o);
-            fputc('"', o);
-            for (const char *p = s; *p; ++p) {
-                if (*p == '\\' || *p == '"') fputc('\\', o);
+            const char *desc = syscall_desc(sys->a[i].no);
+            fprintf(o, "    {\"name\":\"%s\",\"count\":%lu,\"desc\":\"",
+                    nm?nm:"unknown", sys->a[i].count);
+            /* escape quotes/backslashes in desc */
+            for (const char *p = desc?desc:""; *p; ++p) {
+                if (*p=='\\' || *p=='"') fputc('\\', o);
                 fputc(*p, o);
             }
-            fputc('"', o);
-            fprintf(o, "%s\n", (i + 1 < files->n) ? "," : "");
+            fprintf(o, "\"}%s\n", (i+1<sys->n)?",":"");
+        }
+        fprintf(o, "  ],\n  \"files\": [\n");
+        for (size_t i=0;i<files->n;i++) {
+            const char *s = files->a[i];
+            fputs("    \"", o);
+            for (const char *p = s; *p; ++p) {
+                if (*p=='\\' || *p=='"') fputc('\\', o);
+                fputc(*p, o);
+            }
+            fprintf(o, "\"%s\n", (i+1<files->n)?",":"");
         }
         fprintf(o, "  ]\n}\n");
         fclose(o);
         if (verbose) fprintf(stderr, "[sandstat] wrote %s\n", out_path);
     }
 }
+
 
 static void usage(const char *argv0) {
     fprintf(stderr,
@@ -285,6 +516,17 @@ static void usage(const char *argv0) {
 
 int main(int argc, char **argv) {
     int opt;
+    /* quick long-flag check for --no-color before getopt */
+    for (int i=1;i<argc;i++) {
+        if (strcmp(argv[i], "--no-color")==0) {
+            use_color = 0;
+            /* remove the arg by shifting; keep it simple */
+            for (int j=i;j<argc-1;j++) argv[j] = argv[j+1];
+            argc--;
+            break;
+        }
+    }
+
     while ((opt = getopt(argc, argv, "+vo:")) != -1) {
         switch (opt) {
             case 'v': verbose = 1; break;
@@ -292,6 +534,10 @@ int main(int argc, char **argv) {
             default: usage(argv[0]); return 2;
         }
     }
+
+    /* Auto-disable color if not TTY or NO_COLOR is set */
+    if (!isatty(STDOUT_FILENO) || getenv("NO_COLOR")) use_color = 0;
+
 
     int cmd_index = optind;
     if (cmd_index < argc && strcmp(argv[cmd_index], "--") == 0) cmd_index++;
@@ -382,9 +628,24 @@ int main(int argc, char **argv) {
             }
         }
     }
-
     double t1 = now_monotonic_sec();
     print_summary(&sc, &files, t1 - t0, peak_kb, exited_normally, exit_status_code, term_sig);
+
+    /* --- extra resource stats via getrusage (tiny add) --- */
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) == 0) {
+        double u = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6;
+        double s = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+        double cpu = u + s;
+        printf("║ %sResource usage%s  user=%s%.3fs%s  sys=%s%.3fs%s  cpu=%s%.3fs%s\n",
+               C_BOLD, C_RESET, C_GREEN, u, C_RESET, C_GREEN, s, C_RESET, C_GREEN, cpu, C_RESET);
+        printf("║ faults(min/maj)=%s%ld%s/%s%ld%s  ctxsw(vol/invol)=%s%ld%s/%s%ld%s\n\n",
+               C_YELLOW, ru.ru_minflt, C_RESET, C_YELLOW, ru.ru_majflt, C_RESET,
+               C_YELLOW, ru.ru_nvcsw, C_RESET, C_YELLOW, ru.ru_nivcsw, C_RESET);
+    }
+    /* --- end extra --- */
+
+
 
     free(sc.a);
     strvec_free(&files);
