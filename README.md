@@ -57,15 +57,15 @@ sandstat -v -o summary.json -- ls -l
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║ Execution Stats                                                       ║
 ║ Wall Time:  0.123 seconds                                             ║
-║ Peak RSS:   2048 kB (2.00 MB)                                        ║
+║ Peak RSS:   2048 kB (2.00 MB)                                         ║
 ║ Exit Status: 0                                                        ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║ Top Syscalls (Top 10)                                                 ║
-║   Syscall         | Description                      | Count            ║
-║   --------------  | ------------------------------   | ------           ║
-║   mmap            | Maps memory region for process   | 8                ║
-║   openat          | Opens file relative to directory  | 5                ║
-║   fstat           | Gets file status by descriptor   | 4                ║
+║   Syscall         | Description                      | Count          ║
+║   --------------  | ------------------------------   | ------         ║
+║   mmap            | Maps memory region for process   | 8              ║
+║   openat          | Opens file relative to directory  | 5             ║
+║   fstat           | Gets file status by descriptor   | 4              ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║ Files Opened/Created                                                  ║
 ║   /usr/lib/locale/locale-archive                                      ║
