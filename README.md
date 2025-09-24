@@ -131,13 +131,13 @@ Key design choices:
 
 ## Contributing
 
-Contributions are welcome! Please submit issues or pull requests to the [GitHub repository](https://github.com/<your-username>/sandstat). Ideas for new features, syscall additions, or bug fixes are appreciated. For major changes, open an issue to discuss first.
+Contributions are welcome! Please submit issues or pull requests to the [GitHub repository](https://github.com/hd2s/sandstat). Ideas for new features, syscall additions, or bug fixes are appreciated. For major changes, open an issue to discuss first.
 
 ---
 
 ## License
 
-MIT License.
+Copyright (c) 2025 Harsh Singh, University of Auckland. Licensed under the MIT License.
 
 ---
 
