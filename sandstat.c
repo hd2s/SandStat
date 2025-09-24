@@ -100,7 +100,15 @@ static scmap syscall_table[] = {
     { SYS_linkat, "linkat" }, { SYS_symlinkat, "symlinkat" }, { SYS_readlinkat, "readlinkat" },
     { SYS_utimensat, "utimensat" }, { SYS_execveat, "execveat" },
     { SYS_prlimit64, "prlimit64" }, { SYS_statx, "statx" },
-    // ... add more if needed
+    // Additional syscalls to reduce unknowns
+    { SYS_arch_prctl, "arch_prctl" }, { SYS_set_robust_list, "set_robust_list" },
+    { SYS_get_robust_list, "get_robust_list" }, { SYS_futex, "futex" },
+    { SYS_set_tid_address, "set_tid_address" }, { SYS_getdents64, "getdents64" },
+    { SYS_clock_gettime, "clock_gettime" }, { SYS_getrandom, "getrandom" },
+    { SYS_rseq, "rseq" }, { SYS_pipe2, "pipe2" }, { SYS_epoll_create, "epoll_create" },
+    { SYS_epoll_ctl, "epoll_ctl" }, { SYS_epoll_wait, "epoll_wait" },
+    { SYS_eventfd2, "eventfd2" }, { SYS_inotify_init1, "inotify_init1" },
+    { SYS_inotify_add_watch, "inotify_add_watch" }, { SYS_inotify_rm_watch, "inotify_rm_watch" },
 };
 static const size_t syscall_table_len = sizeof(syscall_table)/sizeof(syscall_table[0]);
 
@@ -123,7 +131,7 @@ typedef struct {
 
 static void sysvec_add(SysVec *v, long no) {
     for (size_t i=0;i<v->n;i++) if (v->a[i].no==no){ v->a[i].count++; return; }
-    if (v->n==v->cap){ v->cap = v->cap? v->cap*2:64; v->a = realloc(v->a, v->cap*sizeof(SysCount)); }
+    if (v->n==v->cap){ v->cap = v->cap? v->cap*2:64; v->a = (SysCount *)realloc(v->a, v->cap*sizeof(SysCount)); }
     v->a[v->n++] = (SysCount){.no=no,.count=1};
 }
 
@@ -138,20 +146,18 @@ static int strvec_contains(StrVec *v, const char *s) {
 }
 static void strvec_add(StrVec *v, const char *s) {
     if (strvec_contains(v, s)) return;
-    if (v->n==v->cap){ v->cap = v->cap? v->cap*2:64; v->a = realloc(v->a, v->cap*sizeof(char*)); }
+    if (v->n==v->cap){ v->cap = v->cap? v->cap*2:64; v->a = (char **)realloc(v->a, v->cap*sizeof(char*)); }
     v->a[v->n++] = strdup(s);
 }
 static void strvec_free(StrVec *v){ for (size_t i=0;i<v->n;i++) free(v->a[i]); free(v->a); }
 
 // ---------- Read child memory string ----------
 static ssize_t read_child_string(pid_t pid, unsigned long addr, char *buf, size_t maxlen) {
-    // Use process_vm_readv to pull memory; stop at NUL or maxlen-1
     struct iovec local = { .iov_base = buf, .iov_len = maxlen-1 };
     struct iovec remote = { .iov_base = (void*)addr, .iov_len = maxlen-1 };
     ssize_t r = process_vm_readv(pid, &local, 1, &remote, 1, 0);
     if (r <= 0) return -1;
     size_t n = (size_t)r;
-    // ensure NUL-termination
     size_t i; for (i=0;i<n;i++) if (buf[i]==0) break;
     if (i==n) { if (n<maxlen) buf[n]=0; else buf[maxlen-1]=0; }
     else buf[i]=0;
@@ -167,7 +173,6 @@ static long read_vmrss_kb(pid_t pid) {
     long kb = -1;
     while (fgets(line, sizeof(line), f)) {
         if (starts_with(line, "VmRSS:")) {
-            // format: VmRSS:   12345 kB
             char *p = line;
             while (*p && !isdigit((unsigned char)*p)) p++;
             kb = strtol(p, NULL, 10);
@@ -183,28 +188,62 @@ static int verbose = 0;
 static const char *out_path = NULL;
 
 static void print_summary(SysVec *sys, StrVec *files, double sec, long peak_kb, int exited, int code, int sig) {
-    printf("\n==== sandstat summary ====\n");
-    printf("Wall time: %.3f s\n", sec);
-    if (peak_kb >= 0) printf("Peak RSS: %ld kB (%.2f MB)\n", peak_kb, peak_kb/1024.0);
-    if (exited) printf("Exit status: %d\n", code);
-    else        printf("Terminated by signal: %d\n", sig);
-    printf("\nTop syscalls (count):\n");
-    // Simple bubble sort by count desc (small n)
-    for (size_t i=0;i<sys->n;i++)
-        for (size_t j=i+1;j<sys->n;j++)
-            if (sys->a[j].count > sys->a[i].count){
-                SysCount t=sys->a[i]; sys->a[i]=sys->a[j]; sys->a[j]=t;
-            }
-    size_t show = sys->n<20? sys->n:20;
-    for (size_t i=0;i<show;i++){
-        const char *nm = syscall_name(sys->a[i].no);
-        printf("  %-16s : %lu\n", nm?nm:"(unknown)", sys->a[i].count);
+    // ANSI color codes
+    #define ANSI_RESET   "\033[0m"
+    #define ANSI_BOLD    "\033[1m"
+    #define ANSI_CYAN    "\033[36m"
+    #define ANSI_GREEN   "\033[32m"
+    #define ANSI_YELLOW  "\033[33m"
+    #define ANSI_MAGENTA "\033[35m"
+    #define ANSI_RED     "\033[31m"
+
+    // Print header
+    printf("\n%s╔════════════════════════════ sandstat Summary ════════════════════════════╗%s\n", ANSI_CYAN, ANSI_RESET);
+
+    // Execution stats
+    printf("%s║%s Execution Stats %s║%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_CYAN, ANSI_RESET);
+    printf("%s║%s Wall Time:  %s%.3f seconds%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, sec, ANSI_RESET);
+    if (peak_kb >= 0) {
+        printf("%s║%s Peak RSS:   %s%ld kB (%.2f MB)%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, peak_kb, peak_kb/1024.0, ANSI_RESET);
     }
+    if (exited) {
+        printf("%s║%s Exit Status: %s%d%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_GREEN, code, ANSI_RESET);
+    } else {
+        printf("%s║%s Terminated by Signal: %s%d%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_RED, sig, ANSI_RESET);
+    }
+    printf("%s╠══════════════════════════════════════════════════════════════════════════╣%s\n", ANSI_CYAN, ANSI_RESET);
 
-    printf("\nFiles opened/created:\n");
-    if (files->n==0) printf("  (none captured)\n");
-    for (size_t i=0;i<files->n;i++) printf("  %s\n", files->a[i]);
+    // Syscall counts
+    printf("%s║%s Top Syscalls (Top %zu)%s\n", ANSI_CYAN, ANSI_BOLD, sys->n < 20 ? sys->n : 20, ANSI_RESET);
+    if (sys->n == 0) {
+        printf("%s║%s   (none captured)%s\n", ANSI_CYAN, ANSI_YELLOW, ANSI_RESET);
+    } else {
+        // Sort syscalls by count (descending)
+        for (size_t i = 0; i < sys->n; i++)
+            for (size_t j = i + 1; j < sys->n; j++)
+                if (sys->a[j].count > sys->a[i].count) {
+                    SysCount t = sys->a[i]; sys->a[i] = sys->a[j]; sys->a[j] = t;
+                }
+        size_t show = sys->n < 20 ? sys->n : 20;
+        for (size_t i = 0; i < show; i++) {
+            const char *nm = syscall_name(sys->a[i].no);
+            printf("%s║%s   %-20s : %s%lu%s\n", ANSI_CYAN, ANSI_BOLD, nm ? nm : "(unknown)", ANSI_YELLOW, sys->a[i].count, ANSI_RESET);
+        }
+    }
+    printf("%s╠══════════════════════════════════════════════════════════════════════════╣%s\n", ANSI_CYAN, ANSI_RESET);
 
+    // Files accessed
+    printf("%s║%s Files Opened/Created%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    if (files->n == 0) {
+        printf("%s║%s   (none captured)%s\n", ANSI_CYAN, ANSI_YELLOW, ANSI_RESET);
+    } else {
+        for (size_t i = 0; i < files->n; i++) {
+            printf("%s║%s   %s%s%s\n", ANSI_CYAN, ANSI_BOLD, ANSI_MAGENTA, files->a[i], ANSI_RESET);
+        }
+    }
+    printf("%s╚══════════════════════════════════════════════════════════════════════════╝%s\n", ANSI_CYAN, ANSI_RESET);
+
+    // JSON output
     if (out_path) {
         FILE *o = fopen(out_path, "w");
         if (!o) { perror("fopen -o"); return; }
@@ -214,23 +253,22 @@ static void print_summary(SysVec *sys, StrVec *files, double sec, long peak_kb, 
         if (exited) fprintf(o, "  \"exit_status\": %d,\n", code);
         else        fprintf(o, "  \"term_signal\": %d,\n", sig);
         fprintf(o, "  \"syscalls\": [\n");
-        for (size_t i=0;i<sys->n;i++) {
+        for (size_t i = 0; i < sys->n; i++) {
             const char *nm = syscall_name(sys->a[i].no);
             fprintf(o, "    {\"name\":\"%s\",\"count\":%lu}%s\n",
-                nm?nm:"unknown", sys->a[i].count, (i+1<sys->n)?",":"");
+                nm ? nm : "unknown", sys->a[i].count, (i + 1 < sys->n) ? "," : "");
         }
         fprintf(o, "  ],\n  \"files\": [\n");
-        for (size_t i=0;i<files->n;i++) {
-            // naive JSON string escaping for quotes/backslashes
+        for (size_t i = 0; i < files->n; i++) {
             const char *s = files->a[i];
             fputc(' ', o); fputc(' ', o); fputc(' ', o); fputc(' ', o);
             fputc('"', o);
-            for (const char *p=s; *p; ++p) {
-                if (*p=='\\' || *p=='"') fputc('\\', o);
+            for (const char *p = s; *p; ++p) {
+                if (*p == '\\' || *p == '"') fputc('\\', o);
                 fputc(*p, o);
             }
             fputc('"', o);
-            fprintf(o, "%s\n", (i+1<files->n)?",":"");
+            fprintf(o, "%s\n", (i + 1 < files->n) ? "," : "");
         }
         fprintf(o, "  ]\n}\n");
         fclose(o);
@@ -255,8 +293,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // After getopt, optind points at the first non-option.
-    // If a literal "--" is present, skip it; otherwise treat current as the command.
     int cmd_index = optind;
     if (cmd_index < argc && strcmp(argv[cmd_index], "--") == 0) cmd_index++;
 
@@ -264,11 +300,9 @@ int main(int argc, char **argv) {
 
     char **cmd = &argv[cmd_index];
 
-
     pid_t child = fork();
     if (child < 0) die("fork");
     if (child == 0) {
-        // Child: request ptrace and stop self until parent attaches
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) die("ptrace(TRACEME)");
         raise(SIGSTOP);
         execvp(cmd[0], cmd);
@@ -276,19 +310,16 @@ int main(int argc, char **argv) {
         _exit(127);
     }
 
-    // Parent: attach and configure tracing
     int status;
     if (waitpid(child, &status, 0) == -1) die("waitpid(SIGSTOP)");
     if (!WIFSTOPPED(status)) {
         fprintf(stderr, "Child didn't stop as expected\n"); return 1;
     }
 
-    // Enable syscall-stops via PTRACE_O_TRACESYSGOOD
     if (ptrace(PTRACE_SETOPTIONS, child, NULL,
         (void*)(PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL)) == -1)
         die("ptrace(SETOPTIONS)");
 
-    // Start the child
     if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) == -1) die("ptrace(SYSCALL start)");
 
     double t0 = now_monotonic_sec();
@@ -297,7 +328,7 @@ int main(int argc, char **argv) {
     SysVec sc = {0};
     StrVec files = {0};
 
-    int in_syscall = 0; // toggle to identify entry/exit
+    int in_syscall = 0;
     int exited_normally = 0, exit_status_code = 0, term_sig = 0;
 
     while (1) {
@@ -315,23 +346,14 @@ int main(int argc, char **argv) {
             break;
         } else if (WIFSTOPPED(status)) {
             int sig = WSTOPSIG(status);
-            // Syscall-stop is SIGTRAP | 0x80 (TRACESYSGOOD); detect via 0x80 flag
             if (sig == (SIGTRAP | 0x80)) {
-                // Toggle entry/exit; when entry, capture args & name
                 struct user_regs_struct regs;
                 if (ptrace(PTRACE_GETREGS, child, NULL, &regs) == -1) die("ptrace(GETREGS)");
                 long scno = regs.orig_rax;
                 if (!in_syscall) {
-                    // entry
                     sysvec_add(&sc, scno);
-
-                    // Sample memory on each syscall entry (cheap enough) for peak RSS
                     long kb = read_vmrss_kb(child);
                     if (kb > peak_kb) peak_kb = kb;
-
-                    // Capture file path args for open/creat
-                    // x86_64 calling convention:
-                    // rdi, rsi, rdx, r10, r8, r9
                     if (scno == SYS_open) {
                         unsigned long p = regs.rdi;
                         char buf[4096];
@@ -343,25 +365,17 @@ int main(int argc, char **argv) {
                         if (read_child_string(child, p, buf, sizeof(buf)) > 0)
                             strvec_add(&files, buf), verbose && fprintf(stderr, "[creat] %s\n", buf);
                     } else if (scno == SYS_openat) {
-                        unsigned long p = regs.rsi; // pathname
+                        unsigned long p = regs.rsi;
                         char buf[4096];
                         if (read_child_string(child, p, buf, sizeof(buf)) > 0)
                             strvec_add(&files, buf), verbose && fprintf(stderr, "[openat] %s\n", buf);
                     }
-                } else {
-                    // exit of syscall: could read regs.rax for return value if needed
-                    (void)0;
                 }
                 in_syscall = !in_syscall;
-
-                // Resume to next stop
                 if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) == -1) die("ptrace(SYSCALL cont)");
                 continue;
             }
-
-            // If the child received a signal, pass it through (except initial SIGSTOP)
             if (sig == SIGSTOP || sig == SIGTRAP) {
-                // resume without injecting a signal
                 if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) == -1) die("ptrace(SYSCALL resume)");
             } else {
                 if (ptrace(PTRACE_SYSCALL, child, NULL, (void*)(long)sig) == -1) die("ptrace(SYSCALL pass-sig)");
