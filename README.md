@@ -1,4 +1,5 @@
 ---
+
 # sandstat: A Process Tracing and Profiling Utility
 
 `sandstat` is a lightweight, command-line tool implemented in C for tracing and profiling process behavior in Linux environments (x86_64). Designed for systems programmers, graduate students, and security researchers, it provides concise insights into a process's system calls, file interactions, memory usage, and runtime characteristics. By leveraging the `ptrace` system call and `/proc` filesystem, `sandstat` offers a developer-friendly alternative to verbose tools like `strace`, delivering a human-readable summary and optional JSON output for automated analysis.
